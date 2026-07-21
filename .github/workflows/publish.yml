@@ -1,0 +1,178 @@
+name: publish
+
+# Publishes the Swift bridge from BoundaryML/baml@dhilan/swift-bridge-1.
+# Dev channel: trigger moves to canary release tags when the canonical
+# Phase 6 pipeline lands.
+#
+# Cadence: a cheap Linux poll compares the source branch head against
+# SOURCE_SHA; the expensive macOS build runs only on change (or manual
+# dispatch). Release assets are immutable — one tag per source SHA,
+# never re-uploaded; main's Package.swift is the moving pointer.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: "BoundaryML/baml commit to build (default: branch head)"
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: BoundaryML/baml
+  SOURCE_BRANCH: dhilan/swift-bridge-1
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+      changed: ${{ steps.resolve.outputs.changed }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_SHA" ]; then
+            sha="$INPUT_SHA"
+          else
+            sha="$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_BRANCH" --jq .sha)"
+          fi
+          current="$(cat SOURCE_SHA 2>/dev/null || echo none)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$sha" = "$current" ] && [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "up to date at $sha"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "will publish $sha (was $current)"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.changed == 'true'
+    runs-on: macos-14
+    steps:
+      - name: Checkout dist repo
+        uses: actions/checkout@v4
+        with:
+          path: dist
+
+      - name: Checkout monorepo at source SHA
+        uses: actions/checkout@v4
+        with:
+          repository: BoundaryML/baml
+          ref: ${{ needs.check.outputs.sha }}
+          path: monorepo
+
+      - name: Rust toolchain + Apple targets
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain || rustup toolchain install stable
+          rustup target add \
+            aarch64-apple-darwin x86_64-apple-darwin \
+            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: monorepo/baml_language
+          key: xcframework-all
+
+      - name: Build XCFramework (all slices, release-bridge-swift)
+        run: monorepo/baml_language/sdks/swift/scripts/build-xcframework.sh --all
+
+      - name: Package + checksum + tag
+        id: pack
+        run: |
+          set -euo pipefail
+          SHA="${{ needs.check.outputs.sha }}"
+          SHORT="${SHA:0:12}"
+          VERSION="$(sed -n 's/^canary_version = "\(.*\)"/\1/p' \
+            monorepo/baml_language/release.toml)"
+          TAG="dev-${VERSION}-${SHORT}"
+          ZIP="BamlBridgeFFI-${TAG}.xcframework.zip"
+          (cd monorepo/baml_language/sdks/swift/Binaries \
+            && ditto -c -k --keepParent BamlBridgeFFI.xcframework "$GITHUB_WORKSPACE/$ZIP")
+          # Needs a package context; dist/ has no manifest on the first
+          # run, so use the monorepo's swift package dir.
+          CHECKSUM="$(cd monorepo/baml_language/sdks/swift \
+            && swift package compute-checksum "$GITHUB_WORKSPACE/$ZIP")"
+          {
+            echo "tag=$TAG"
+            echo "zip=$ZIP"
+            echo "checksum=$CHECKSUM"
+            echo "version=$VERSION"
+            echo "short=$SHORT"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create immutable release + upload asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.pack.outputs.tag }}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists — immutable, refusing to overwrite"
+            exit 1
+          fi
+          gh release create "$TAG" "${{ steps.pack.outputs.zip }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Built from ${SOURCE_REPO}@${{ needs.check.outputs.sha }} (branch ${SOURCE_BRANCH}, canonical version ${{ steps.pack.outputs.version }}).
+          SwiftPM checksum: \`${{ steps.pack.outputs.checksum }}\`
+          Regenerate your app's SDK from this exact commit (see README: version handshake)."
+
+      - name: Stamp manifest, sync sources, commit
+        run: |
+          set -euo pipefail
+          cd dist
+          TAG="${{ steps.pack.outputs.tag }}"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${{ steps.pack.outputs.zip }}"
+          rm -rf Sources
+          mkdir -p Sources
+          cp -R ../monorepo/baml_language/sdks/swift/Sources/BamlBridge Sources/BamlBridge
+          sed -e "s|__ZIP_URL__|$URL|" \
+              -e "s|__CHECKSUM__|${{ steps.pack.outputs.checksum }}|" \
+              -e "s|__SOURCE_SHA__|${{ needs.check.outputs.sha }}|" \
+              -e "s|__VERSION__|${{ steps.pack.outputs.version }}|" \
+              .github/Package.swift.template > Package.swift
+          echo "${{ needs.check.outputs.sha }}" > SOURCE_SHA
+          swift package dump-package > /dev/null  # manifest sanity check
+          git config user.name "baml-swift-publisher"
+          git config user.email "noreply@boundaryml.com"
+          git add -A
+          git commit -m "publish $TAG from ${SOURCE_REPO}@${{ steps.pack.outputs.short }}"
+          git push origin HEAD:main
+
+      - name: Smoke-resolve the published package
+        run: |
+          set -euo pipefail
+          mkdir smoke && cd smoke
+          swift package init --type executable --name Smoke > /dev/null
+          cat > Package.swift <<'EOF'
+          // swift-tools-version: 6.1
+          import PackageDescription
+          let package = Package(
+              name: "Smoke",
+              platforms: [.macOS(.v13)],
+              dependencies: [.package(url: "https://github.com/BoundaryML/baml-swift", branch: "main")],
+              targets: [.executableTarget(name: "Smoke",
+                  dependencies: [.product(name: "BamlBridge", package: "baml-swift")])]
+          )
+          EOF
+          cat > Sources/Smoke/main.swift <<'EOF'
+          import BamlBridge
+          print("linked BamlBridge OK")
+          EOF
+          swift run 2>&1 | tail -2
