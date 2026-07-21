@@ -220,4 +220,4 @@ jobs:
           import BamlBridge
           print("linked BamlBridge OK")
           EOF
-          swift run 2>&1 | tail -2
+          swift run
