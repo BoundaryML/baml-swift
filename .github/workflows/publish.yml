@@ -134,6 +134,13 @@ jobs:
 
       - name: Build XCFramework (all slices, release-bridge-swift)
         if: needs.check.outputs.have_release != 'true'
+        # Pin deployment targets to the package minimums so the Rust
+        # objects match what consumers link for (otherwise cargo stamps
+        # them with the host's OS version and every consumer link emits
+        # was-built-for-newer warnings).
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+          IPHONEOS_DEPLOYMENT_TARGET: "16.0"
         run: monorepo/baml_language/sdks/swift/scripts/build-xcframework.sh --all
 
       - name: Zip + create immutable release
@@ -198,7 +205,16 @@ jobs:
             echo "tree already up to date — nothing to commit"
           else
             git commit -m "publish $TAG from ${SOURCE_REPO}@${{ needs.check.outputs.short }}"
-            git push origin HEAD:main
+            # A concurrent run (cron vs dispatch) may have pushed the
+            # same publish commit first — rebase and retry rather than
+            # failing on non-fast-forward; land as no-op if identical.
+            for i in 1 2 3; do
+              if git push origin HEAD:main; then break; fi
+              git fetch origin main
+              git rebase origin/main || { git rebase --abort; git reset --hard origin/main; }
+              git diff --quiet origin/main && { echo "already published by concurrent run"; break; }
+              sleep $((i * 5))
+            done
           fi
 
       - name: Smoke-resolve the published package
@@ -220,4 +236,10 @@ jobs:
           import BamlBridge
           print("linked BamlBridge OK")
           EOF
-          swift run
+          swift build
+          BIN=.build/debug/Smoke
+          # Re-ad-hoc-sign: runners' AMFI can SIGKILL binaries whose
+          # linker-produced ad-hoc signature it dislikes (exit 137).
+          codesign --force --sign - "$BIN"
+          codesign -dv "$BIN" 2>&1 | head -3
+          "$BIN" || { echo "smoke binary exited $? (137 = AMFI kill)"; exit 1; }
