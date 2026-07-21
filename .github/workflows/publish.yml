@@ -76,9 +76,14 @@ jobs:
           path: monorepo
 
       - name: Rust toolchain + Apple targets
+        # Run from inside the monorepo so rustup resolves (and
+        # auto-installs) the toolchain pinned by rust-toolchain.toml —
+        # targets added to the runner's default toolchain are invisible
+        # to the pinned one cargo actually uses.
+        working-directory: monorepo/baml_language
         run: |
           set -euo pipefail
-          rustup show active-toolchain || rustup toolchain install stable
+          rustup show active-toolchain
           rustup target add \
             aarch64-apple-darwin x86_64-apple-darwin \
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
