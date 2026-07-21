@@ -111,19 +111,14 @@ jobs:
 
       # ----- build path: only when this SHA has no published release -----
 
-      - name: Rust toolchain + Apple targets
+      - name: Rust toolchain
         if: needs.check.outputs.have_release != 'true'
-        # Run from inside the monorepo so rustup resolves (and
-        # auto-installs) the toolchain pinned by rust-toolchain.toml —
-        # targets added to the runner's default toolchain are invisible
-        # to the pinned one cargo actually uses.
+        # Runs inside the monorepo so rustup auto-installs the pinned
+        # toolchain; cross-target provisioning and deployment-target
+        # pins live in build-xcframework.sh itself (build knowledge
+        # stays in the monorepo).
         working-directory: monorepo/baml_language
-        run: |
-          set -euo pipefail
-          rustup show active-toolchain
-          rustup target add \
-            aarch64-apple-darwin x86_64-apple-darwin \
-            aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
+        run: rustup show active-toolchain
 
       - name: Rust cache
         if: needs.check.outputs.have_release != 'true'
@@ -132,25 +127,18 @@ jobs:
           workspaces: monorepo/baml_language
           key: xcframework-all
 
-      - name: Build XCFramework (all slices, release-bridge-swift)
+      - name: Build + package XCFramework (all slices)
         if: needs.check.outputs.have_release != 'true'
-        # Pin deployment targets to the package minimums so the Rust
-        # objects match what consumers link for (otherwise cargo stamps
-        # them with the host's OS version and every consumer link emits
-        # was-built-for-newer warnings).
-        env:
-          MACOSX_DEPLOYMENT_TARGET: "13.0"
-          IPHONEOS_DEPLOYMENT_TARGET: "16.0"
-        run: monorepo/baml_language/sdks/swift/scripts/build-xcframework.sh --all
+        run: |
+          monorepo/baml_language/sdks/swift/scripts/build-xcframework.sh \
+            --all --zip "$GITHUB_WORKSPACE/$ZIP"
 
-      - name: Zip + create immutable release
+      - name: Create immutable release
         if: needs.check.outputs.have_release != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          (cd monorepo/baml_language/sdks/swift/Binaries \
-            && ditto -c -k --keepParent BamlBridgeFFI.xcframework "$GITHUB_WORKSPACE/$ZIP")
           gh release create "$TAG" "$ZIP" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
