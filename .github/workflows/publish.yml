@@ -8,6 +8,12 @@ name: publish
 # SOURCE_SHA; the expensive macOS build runs only on change (or manual
 # dispatch). Release assets are immutable — one tag per source SHA,
 # never re-uploaded; main's Package.swift is the moving pointer.
+#
+# Caching, two layers:
+#   1. If the release for this SHA already exists, the whole Rust
+#      build is skipped — the published asset is downloaded and
+#      checksummed instead (re-runs and stamp-only fixes cost ~2 min).
+#   2. Swatinem/rust-cache shares dependency compilation across SHAs.
 
 on:
   schedule:
@@ -35,6 +41,11 @@ jobs:
     outputs:
       sha: ${{ steps.resolve.outputs.sha }}
       changed: ${{ steps.resolve.outputs.changed }}
+      tag: ${{ steps.resolve.outputs.tag }}
+      zip: ${{ steps.resolve.outputs.zip }}
+      version: ${{ steps.resolve.outputs.version }}
+      short: ${{ steps.resolve.outputs.short }}
+      have_release: ${{ steps.resolve.outputs.have_release }}
     steps:
       - uses: actions/checkout@v4
       - id: resolve
@@ -49,19 +60,42 @@ jobs:
             sha="$(gh api "repos/$SOURCE_REPO/commits/$SOURCE_BRANCH" --jq .sha)"
           fi
           current="$(cat SOURCE_SHA 2>/dev/null || echo none)"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          # Tag is computable without a checkout: one API read of
+          # release.toml at the source SHA.
+          version="$(gh api "repos/$SOURCE_REPO/contents/baml_language/release.toml?ref=$sha" \
+            --jq .content | base64 -d | sed -n 's/^canary_version = "\(.*\)"/\1/p')"
+          [ -n "$version" ] || { echo "::error::could not read canary_version"; exit 1; }
+          short="${sha:0:12}"
+          tag="dev-${version}-${short}"
+          zip="BamlBridgeFFI-${tag}.xcframework.zip"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            have_release=true
+          else
+            have_release=false
+          fi
+          {
+            echo "sha=$sha"
+            echo "version=$version"
+            echo "short=$short"
+            echo "tag=$tag"
+            echo "zip=$zip"
+            echo "have_release=$have_release"
+          } >> "$GITHUB_OUTPUT"
           if [ "$sha" = "$current" ] && [ "${{ github.event_name }}" = "schedule" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "up to date at $sha"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "will publish $sha (was $current)"
+            echo "will publish $tag (release exists: $have_release)"
           fi
 
   publish:
     needs: check
     if: needs.check.outputs.changed == 'true'
     runs-on: macos-15
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      ZIP: ${{ needs.check.outputs.zip }}
     steps:
       - name: Checkout dist repo
         uses: actions/checkout@v4
@@ -75,7 +109,10 @@ jobs:
           ref: ${{ needs.check.outputs.sha }}
           path: monorepo
 
+      # ----- build path: only when this SHA has no published release -----
+
       - name: Rust toolchain + Apple targets
+        if: needs.check.outputs.have_release != 'true'
         # Run from inside the monorepo so rustup resolves (and
         # auto-installs) the toolchain pinned by rust-toolchain.toml —
         # targets added to the runner's default toolchain are invisible
@@ -89,58 +126,52 @@ jobs:
             aarch64-apple-ios aarch64-apple-ios-sim x86_64-apple-ios
 
       - name: Rust cache
+        if: needs.check.outputs.have_release != 'true'
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: monorepo/baml_language
           key: xcframework-all
 
       - name: Build XCFramework (all slices, release-bridge-swift)
+        if: needs.check.outputs.have_release != 'true'
         run: monorepo/baml_language/sdks/swift/scripts/build-xcframework.sh --all
 
-      - name: Package + tag
-        id: pack
-        run: |
-          set -euo pipefail
-          SHA="${{ needs.check.outputs.sha }}"
-          SHORT="${SHA:0:12}"
-          VERSION="$(sed -n 's/^canary_version = "\(.*\)"/\1/p' \
-            monorepo/baml_language/release.toml)"
-          TAG="dev-${VERSION}-${SHORT}"
-          ZIP="BamlBridgeFFI-${TAG}.xcframework.zip"
-          (cd monorepo/baml_language/sdks/swift/Binaries \
-            && ditto -c -k --keepParent BamlBridgeFFI.xcframework "$GITHUB_WORKSPACE/$ZIP")
-          {
-            echo "tag=$TAG"
-            echo "zip=$ZIP"
-            echo "version=$VERSION"
-            echo "short=$SHORT"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Ensure immutable release (create or reuse) + checksum
-        id: release
+      - name: Zip + create immutable release
+        if: needs.check.outputs.have_release != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ steps.pack.outputs.tag }}"
-          ZIP="${{ steps.pack.outputs.zip }}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            # Idempotent re-run: the asset already published is the
-            # canonical artifact. Rebuilds are not byte-reproducible, so
-            # NEVER re-upload — replace the local zip with the published
-            # one and checksum THAT.
-            echo "release $TAG exists — reusing its published asset"
-            rm -f "$ZIP"
-            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --pattern '*.zip' --output "$ZIP"
-          else
-            gh release create "$TAG" "$ZIP" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "$TAG" \
-              --notes "Built from ${SOURCE_REPO}@${{ needs.check.outputs.sha }} (branch ${SOURCE_BRANCH}, canonical version ${{ steps.pack.outputs.version }}). Regenerate your app's SDK from this exact commit (see README: version handshake)."
-          fi
-          # Needs a package context; dist/ has no manifest on the first
-          # run, so use the monorepo's swift package dir.
+          (cd monorepo/baml_language/sdks/swift/Binaries \
+            && ditto -c -k --keepParent BamlBridgeFFI.xcframework "$GITHUB_WORKSPACE/$ZIP")
+          gh release create "$TAG" "$ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --notes "Built from ${SOURCE_REPO}@${{ needs.check.outputs.sha }} (branch ${SOURCE_BRANCH}, canonical version ${{ needs.check.outputs.version }}). Regenerate your app's SDK from this exact commit (see README: version handshake)."
+
+      # ----- reuse path: the published asset is the canonical artifact -----
+
+      - name: Download published asset
+        if: needs.check.outputs.have_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "release $TAG exists — reusing its published asset (build skipped)"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' --output "$ZIP"
+
+      # ----- common tail -----
+
+      - name: Checksum the canonical asset
+        id: checksum
+        # Always checksums the bytes consumers will download: the fresh
+        # zip on the build path (just uploaded, hence canonical), the
+        # downloaded asset on the reuse path. Rebuilds are not
+        # byte-reproducible, so never checksum a rebuild of an
+        # already-published tag.
+        run: |
+          set -euo pipefail
           CHECKSUM="$(cd monorepo/baml_language/sdks/swift \
             && swift package compute-checksum "$GITHUB_WORKSPACE/$ZIP")"
           echo "checksum=$CHECKSUM" >> "$GITHUB_OUTPUT"
@@ -149,29 +180,31 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          TAG="${{ steps.pack.outputs.tag }}"
-          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/${{ steps.pack.outputs.zip }}"
+          URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$TAG/$ZIP"
           rm -rf Sources
           mkdir -p Sources
           cp -R ../monorepo/baml_language/sdks/swift/Sources/BamlBridge Sources/BamlBridge
           sed -e "s|__ZIP_URL__|$URL|" \
-              -e "s|__CHECKSUM__|${{ steps.release.outputs.checksum }}|" \
+              -e "s|__CHECKSUM__|${{ steps.checksum.outputs.checksum }}|" \
               -e "s|__SOURCE_SHA__|${{ needs.check.outputs.sha }}|" \
-              -e "s|__VERSION__|${{ steps.pack.outputs.version }}|" \
+              -e "s|__VERSION__|${{ needs.check.outputs.version }}|" \
               .github/Package.swift.template > Package.swift
           echo "${{ needs.check.outputs.sha }}" > SOURCE_SHA
           swift package dump-package > /dev/null  # manifest sanity check
           git config user.name "baml-swift-publisher"
           git config user.email "noreply@boundaryml.com"
           git add -A
-          git commit -m "publish $TAG from ${SOURCE_REPO}@${{ steps.pack.outputs.short }}"
-          git push origin HEAD:main
+          if git diff --cached --quiet; then
+            echo "tree already up to date — nothing to commit"
+          else
+            git commit -m "publish $TAG from ${SOURCE_REPO}@${{ needs.check.outputs.short }}"
+            git push origin HEAD:main
+          fi
 
       - name: Smoke-resolve the published package
         run: |
           set -euo pipefail
-          mkdir smoke && cd smoke
-          swift package init --type executable --name Smoke > /dev/null
+          mkdir -p smoke/Sources/Smoke && cd smoke
           cat > Package.swift <<'EOF'
           // swift-tools-version: 6.1
           import PackageDescription
