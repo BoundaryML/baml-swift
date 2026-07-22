@@ -4,10 +4,10 @@ SwiftPM distribution of the [BAML](https://github.com/BoundaryML/baml) Swift
 bridge: the `BamlBridge` runtime package plus the `BamlBridgeFFI` native
 XCFramework (macOS arm64/x86_64, iOS device, iOS simulator).
 
-> **Dev channel.** This repo is currently published from the
-> `dhilan/swift-bridge-1` branch of the monorepo, ahead of the official
-> release pipeline. iOS slices compile and pass simulator tests but are not
-> yet device-certified. Expect breaking changes between tags.
+> **Dev channel.** This repo is published automatically from the `canary`
+> branch of the monorepo (rebuilds only when the Swift bridge, C ABI, wire
+> protos, or version actually change). iOS slices compile and pass simulator
+> tests but are not yet device-certified. Expect breaking changes between tags.
 
 ## Consuming
 
@@ -47,7 +47,7 @@ Nobody edits this repo by hand. The
 [`publish`](.github/workflows/publish.yml) workflow:
 
 1. Polls (and can be manually dispatched for) the head of
-   `BoundaryML/baml@dhilan/swift-bridge-1`.
+   `BoundaryML/baml@canary`.
 2. Checks out the monorepo at that SHA and builds all five Apple slices via
    `sdks/swift/scripts/build-xcframework.sh --all`
    (`release-bridge-swift` profile: panic=unwind, caught at the ABI

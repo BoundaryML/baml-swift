@@ -33,7 +33,7 @@ concurrency:
 
 env:
   SOURCE_REPO: BoundaryML/baml
-  SOURCE_BRANCH: dhilan/swift-bridge-1
+  SOURCE_BRANCH: canary
 
 jobs:
   check:
@@ -81,12 +81,38 @@ jobs:
             echo "zip=$zip"
             echo "have_release=$have_release"
           } >> "$GITHUB_OUTPUT"
-          if [ "$sha" = "$current" ] && [ "${{ github.event_name }}" = "schedule" ]; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "up to date at $sha"
-          else
-            echo "changed=true" >> "$GITHUB_OUTPUT"
+          # Manual dispatch and an existing-release republish always
+          # proceed. A scheduled poll only builds when the bridge changed
+          # since the last published SHA — canary commits that don't touch
+          # sdks/swift, the C ABI, the wire protos, or the version are
+          # skipped so we don't mint a 20-min macOS build per unrelated
+          # monorepo commit.
+          relevant() {
+            case "$1" in
+              baml_language/sdks/swift/*|\
+              baml_language/crates/bridge_cffi/*|\
+              baml_language/crates/bridge_ctypes/*|\
+              baml_language/release.toml) return 0 ;;
+            esac
+            return 1
+          }
+          decide_changed() {
+            [ "${{ github.event_name }}" != "schedule" ] && { echo true; return; }
+            [ "$sha" = "$current" ] && { echo false; return; }
+            [ "$current" = "none" ] && { echo true; return; }
+            # Any Swift-relevant file in current..sha ?
+            files="$(gh api "repos/$SOURCE_REPO/compare/$current...$sha" \
+              --jq '.files[].filename' 2>/dev/null || echo __compare_failed__)"
+            [ "$files" = "__compare_failed__" ] && { echo true; return; }  # fail open
+            while IFS= read -r f; do relevant "$f" && { echo true; return; }; done <<< "$files"
+            echo false
+          }
+          changed="$(decide_changed)"
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+          if [ "$changed" = "true" ]; then
             echo "will publish $tag (release exists: $have_release)"
+          else
+            echo "no Swift-relevant change since $current — skipping"
           fi
 
   publish:
