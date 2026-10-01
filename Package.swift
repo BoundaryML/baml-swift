@@ -2,7 +2,7 @@
 // GENERATED — do not edit by hand.
 // Source of truth: BoundaryML/baml @ baml_language/sdks/swift/mirror/Package.swift
 // Mirrored by the release pipeline (assemble-swift-sdk-mirror).
-// Built from BoundaryML/baml @ 007778ae93cb69da51ee4c303c6a1329511b53b8 (version 0.20.2-nightly.20260929.a).
+// Built from BoundaryML/baml @ 92538ac9f41982419966e88d47ae78722076188a (version 0.20.2-nightly.20260930.a).
 import PackageDescription
 
 let package = Package(
@@ -20,8 +20,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "BamlBridgeFFI",
-            url: "https://github.com/BoundaryML/baml/releases/download/baml-language-0.20.2-nightly.20260929.a/BamlBridgeFFI-0.20.2-nightly.20260929.a.xcframework.zip",
-            checksum: "2a2e32f70d711c8a660adf8979fb22c0e8a5008627d9b5b01be7b6068b18e82d"
+            url: "https://github.com/BoundaryML/baml/releases/download/baml-language-0.20.2-nightly.20260930.a/BamlBridgeFFI-0.20.2-nightly.20260930.a.xcframework.zip",
+            checksum: "9974f379399ff2fbd95971f08b5a45feb44f593319c10d39d424e0a39f8e9ee5"
         ),
         .target(
             name: "BamlBridge",
