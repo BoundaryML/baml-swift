@@ -1,5 +1,5 @@
 public enum BamlBridgeIdentity {
     public static let runtimeName = "baml-swift"
-    public static let toolchainVersion = "0.25.3-nightly.20261106.a"
-    public static let bridgeRuntimeVersion = "0.25.3-nightly.20261106.a"
+    public static let toolchainVersion = "0.25.3-nightly.20261108.a"
+    public static let bridgeRuntimeVersion = "0.25.3-nightly.20261108.a"
 }
